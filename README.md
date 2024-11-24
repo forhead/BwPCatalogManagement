@@ -10,3 +10,12 @@ npm -v
 ```
 
 # 
+
+
+confirm when the shoplie application for bwp will ga?
+
+
+https://wiki.labcollab.net/confluence/display/TALDOV/Santos+Elements+Master+List
+
+
+
