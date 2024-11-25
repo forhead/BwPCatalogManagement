@@ -9,13 +9,5 @@ npm -v
 10.9.0
 ```
 
-# 
-
-
-confirm when the shoplie application for bwp will ga?
-
-
-https://wiki.labcollab.net/confluence/display/TALDOV/Santos+Elements+Master+List
-
-
+# code structure 
 
