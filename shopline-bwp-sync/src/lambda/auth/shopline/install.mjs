@@ -1,9 +1,11 @@
 import crypto from 'crypto';
 import { SecretsManager } from '@aws-sdk/client-secrets-manager';
 import { DynamoDB } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
 
 const secretsManager = new SecretsManager();
 const dynamodb = new DynamoDB();
+const docClient = DynamoDBDocumentClient.from(dynamodb);
 
 // 获取Shopline凭证
 async function getShoplineCredentials() {
@@ -47,6 +49,11 @@ async function verifySign(params, secret) {
   return sign === calculatedSign;
 }
 
+// 生成唯一ID
+function generateUniqueId() {
+  return Date.now().toString(36) + Math.random().toString(36).substr(2);
+}
+
 export const handler = async (event) => {
   try {
     console.log('Installation request received:', event);
@@ -72,18 +79,22 @@ export const handler = async (event) => {
       };
     }
 
+    // 生成唯一的安装ID
+    const installationId = generateUniqueId();
+
     // 记录安装状态
-    await dynamodb.putItem({
+    await docClient.send(new PutCommand({
       TableName: process.env.INSTALLATION_TABLE,
       Item: {
-        id: { S: handle },
-        platform: { S: 'shopline' },
-        status: { S: 'installing' },
-        appkey: { S: appkey },
-        timestamp: { N: timestamp },
-        createdAt: { N: Date.now().toString() },
+        id: handle,
+        platform: 'shopline',
+        status: 'installing',
+        appkey: appkey,
+        timestamp: parseInt(timestamp),
+        createdAt: Date.now(),
+        installationId: installationId,
       },
-    });
+    }));
 
     // 构建callback URL
     const callbackUrl = `https://${process.env.API_GATEWAY_ID}.execute-api.us-east-1.amazonaws.com/${process.env.API_GATEWAY_STAGE}/auth/shopline/callback`;
@@ -95,7 +106,8 @@ export const handler = async (event) => {
       appKey: credentials.appKey,
       responseType: 'code',
       scope: 'read_products,write_products',
-      redirectUri: encodedCallbackUrl, // 使用已编码的URL
+      redirectUri: encodedCallbackUrl,
+      state: installationId, // 使用installationId作为state
     });
 
     const authUrl = `https://${handle}.myshopline.com/admin/oauth-web/#/oauth/authorize?${authParams.toString()}`;

@@ -5,7 +5,6 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
-import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
@@ -16,7 +15,7 @@ export class ShoplineBwpSyncStack extends cdk.Stack {
     super(scope, id, props);
 
     // DynamoDB Tables
-    const productMappingTable = new dynamodb.Table(this, 'ProductMapping', {
+    const installationTable = new dynamodb.Table(this, 'InstallationTable', {
       partitionKey: { name: 'id', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'platform', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -24,16 +23,8 @@ export class ShoplineBwpSyncStack extends cdk.Stack {
       pointInTimeRecovery: true,
     });
 
-    // Add GSI for reverse lookup
-    productMappingTable.addGlobalSecondaryIndex({
-      indexName: 'PlatformProductIndex',
-      partitionKey: { name: 'platformProductId', type: dynamodb.AttributeType.STRING },
-      sortKey: { name: 'platform', type: dynamodb.AttributeType.STRING },
-    });
-
-    const syncStateTable = new dynamodb.Table(this, 'SyncState', {
-      partitionKey: { name: 'id', type: dynamodb.AttributeType.STRING },
-      sortKey: { name: 'timestamp', type: dynamodb.AttributeType.STRING },
+    const bwpTokenStoreTable = new dynamodb.Table(this, 'BwpTokenStore', {
+      partitionKey: { name: 'installation_id', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
       timeToLiveAttribute: 'ttl',
@@ -48,24 +39,10 @@ export class ShoplineBwpSyncStack extends cdk.Stack {
       description: 'BWP API credentials',
     });
 
-    // SQS Queues
-    const deadLetterQueue = new sqs.Queue(this, 'DeadLetterQueue', {
-      retentionPeriod: Duration.days(14),
-    });
-
-    const syncQueue = new sqs.Queue(this, 'SyncQueue', {
-      visibilityTimeout: Duration.seconds(300),
-      deadLetterQueue: {
-        queue: deadLetterQueue,
-        maxReceiveCount: 3,
-      },
-    });
-
     // Lambda Functions
     const lambdaEnvironment = {
-      PRODUCT_MAPPING_TABLE: productMappingTable.tableName,
-      SYNC_STATE_TABLE: syncStateTable.tableName,
-      SYNC_QUEUE_URL: syncQueue.queueUrl,
+      INSTALLATION_TABLE: installationTable.tableName,
+      BWP_TOKEN_STORE_TABLE: bwpTokenStoreTable.tableName,
       SHOPLINE_CREDENTIALS_ARN: shoplineCredentials.secretArn,
       BWP_CREDENTIALS_ARN: bwpCredentials.secretArn,
     };
@@ -80,17 +57,15 @@ export class ShoplineBwpSyncStack extends cdk.Stack {
       iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')
     );
     
-    productMappingTable.grantReadWriteData(lambdaRole);
-    syncStateTable.grantReadWriteData(lambdaRole);
-    syncQueue.grantSendMessages(lambdaRole);
-    syncQueue.grantConsumeMessages(lambdaRole);
+    installationTable.grantReadWriteData(lambdaRole);
+    bwpTokenStoreTable.grantReadWriteData(lambdaRole);
     shoplineCredentials.grantRead(lambdaRole);
     bwpCredentials.grantRead(lambdaRole);
 
     // Shopline Webhook Handler
     const shoplineWebhookHandler = new lambda.Function(this, 'ShoplineWebhookHandler', {
       runtime: lambda.Runtime.NODEJS_18_X,
-      code: lambda.Code.fromAsset('../shopline-bwp-sync/src/lambda/shopline'),
+      code: lambda.Code.fromAsset('../shopline-bwp-sync/src/lambda'),
       handler: 'webhook.handler',
       environment: lambdaEnvironment,
       timeout: Duration.seconds(30),
@@ -98,40 +73,40 @@ export class ShoplineBwpSyncStack extends cdk.Stack {
       role: lambdaRole,
     });
 
-    // BWP Event Handler
-    const bwpEventHandler = new lambda.Function(this, 'BwpEventHandler', {
+    // Event Handler (for EventBridge)
+    const eventHandler = new lambda.Function(this, 'EventHandler', {
       runtime: lambda.Runtime.NODEJS_18_X,
-      code: lambda.Code.fromAsset('../shopline-bwp-sync/src/lambda/bwp'),
+      code: lambda.Code.fromAsset('../shopline-bwp-sync/src/lambda'),
       handler: 'event.handler',
       environment: lambdaEnvironment,
-      timeout: Duration.seconds(30),
-      memorySize: 256,
+      timeout: Duration.seconds(300),
+      memorySize: 512,
       role: lambdaRole,
     });
 
     // Product CRUD Handler
     const productCrudHandler = new lambda.Function(this, 'ProductCrudHandler', {
       runtime: lambda.Runtime.NODEJS_18_X,
-      code: lambda.Code.fromAsset('../shopline-bwp-sync/src/lambda/product'),
-      handler: 'crud.handler',
+      code: lambda.Code.fromAsset('../shopline-bwp-sync/src/lambda'),
+      handler: 'product/crud.handler',
       environment: lambdaEnvironment,
       timeout: Duration.seconds(30),
       memorySize: 256,
       role: lambdaRole,
     });
 
-    // 创建 API Gateway 的 CloudWatch 日志角色
+    // API Gateway Logging Role
     const apiGatewayLoggingRole = new iam.Role(this, 'ApiGatewayLoggingRole', {
-        assumedBy: new iam.ServicePrincipal('apigateway.amazonaws.com'),
-        managedPolicies: [
-            iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonAPIGatewayPushToCloudWatchLogs')
-        ],
-        });
-    
-        // 创建 API Gateway 账号设置
-        const apiGatewayAccount = new apigateway.CfnAccount(this, 'ApiGatewayAccount', {
-        cloudWatchRoleArn: apiGatewayLoggingRole.roleArn
-        });
+      assumedBy: new iam.ServicePrincipal('apigateway.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonAPIGatewayPushToCloudWatchLogs')
+      ],
+    });
+
+    // API Gateway Account
+    new apigateway.CfnAccount(this, 'ApiGatewayAccount', {
+      cloudWatchRoleArn: apiGatewayLoggingRole.roleArn
+    });
 
     // API Gateway
     const api = new apigateway.RestApi(this, 'ShoplineBwpApi', {
@@ -150,36 +125,30 @@ export class ShoplineBwpSyncStack extends cdk.Stack {
     shoplineWebhook.addMethod('POST', new apigateway.LambdaIntegration(shoplineWebhookHandler));
 
     const products = api.root.addResource('products');
-    products.addMethod('GET', new apigateway.LambdaIntegration(productCrudHandler));
-    products.addMethod('POST', new apigateway.LambdaIntegration(productCrudHandler));
+    products.addMethod('GET', new apigateway.LambdaIntegration(productCrudHandler), {
+      requestParameters: {
+        'method.request.querystring.handle': true,
+      },
+    });
     
     const product = products.addResource('{id}');
-    product.addMethod('GET', new apigateway.LambdaIntegration(productCrudHandler));
-    product.addMethod('PUT', new apigateway.LambdaIntegration(productCrudHandler));
-    product.addMethod('DELETE', new apigateway.LambdaIntegration(productCrudHandler));
-
-    // EventBridge Rule for BWP Events
-    const bwpEventRule = new events.Rule(this, 'BwpEventRule', {
-      eventPattern: {
-        source: ['com.bwp.product'],
-        detailType: ['product.updated', 'product.created', 'product.deleted'],
+    product.addMethod('PUT', new apigateway.LambdaIntegration(productCrudHandler), {
+      requestParameters: {
+        'method.request.querystring.handle': true,
       },
     });
 
-    bwpEventRule.addTarget(new targets.LambdaFunction(bwpEventHandler));
+    // EventBridge Rule for periodic sync
+    const syncRule = new events.Rule(this, 'SyncRule', {
+      schedule: events.Schedule.rate(Duration.hours(1)),
+    });
 
-    // CloudWatch Alarms
-    // TODO: Add CloudWatch alarms for monitoring
+    syncRule.addTarget(new targets.LambdaFunction(eventHandler));
 
     // Outputs
     new cdk.CfnOutput(this, 'ApiUrl', {
       value: api.url,
       description: 'API Gateway URL',
-    });
-
-    new cdk.CfnOutput(this, 'SyncQueueUrl', {
-      value: syncQueue.queueUrl,
-      description: 'Sync Queue URL',
     });
   }
 }
