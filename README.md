@@ -10,4 +10,5 @@ npm -v
 ```
 
 # code structure 
+API Gateway use Resetful API
 
